@@ -1,5 +1,5 @@
-// SketchBattle Worker - WebSocket Game Server
-// Deploy ini ke Cloudflare Workers
+// SketchBattle Worker - WebSocket Game Server (FIXED)
+// Deploy ke Cloudflare Workers
 
 const WORDS = [
   'apple','banana','car','dog','elephant','fish','guitar','house','island',
@@ -22,22 +22,36 @@ const MIN_PLAYERS = 3;
 const MAX_PLAYERS = 8;
 const ROUNDS_PER_GAME = 3;
 
-// ─── Durable Object ───────────────────────────────────────────────────
 export class GameRoom {
-  constructor(state) {
-    this.state    = state;
-    this.sessions = new Map();   // ws → {id,name,score,isHost,ready}
-    this.players  = [];          // ordered ids
-    this.gState   = 'waiting';   // waiting|selectingWord|drawing|roundEnd|gameOver
-    this.drawer   = null;
-    this.word     = null;
-    this.round    = 0;
-    this.history  = [];
-    this.guessed  = new Set();
-    this.wordOpts = [];
-    this.timeLeft = 0;
-    this.timerRef = null;
-    this.wsTimeout= null;
+  constructor(state, env) {
+    this.state      = state;
+    this.env        = env;
+    this.playerData = new Map(); // playerId -> {id, name, score, isHost, ready}
+    this.players    = [];
+    this.gState     = 'waiting';
+    this.drawer     = null;
+    this.word       = null;
+    this.round      = 0;
+    this.history    = [];
+    this.guessed    = new Set();
+    this.wordOpts   = [];
+    this.timeLeft   = 0;
+    this.timerRef   = null;
+    this.wsTimeout  = null;
+  }
+
+  getPlayerIdFromWs(ws) {
+    try {
+      const tag = ws.deserializeAttachment();
+      return tag ? tag.id : null;
+    } catch { return null; }
+  }
+
+  getWsById(playerId) {
+    for (const ws of this.state.getWebSockets()) {
+      if (this.getPlayerIdFromWs(ws) === playerId) return ws;
+    }
+    return null;
   }
 
   async fetch(req) {
@@ -49,13 +63,16 @@ export class GameRoom {
   }
 
   async webSocketMessage(ws, raw) {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
-    const sess = this.sessions.get(ws);
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    const playerId = this.getPlayerIdFromWs(ws);
+    const sess = playerId ? this.playerData.get(playerId) : null;
 
     switch (msg.type) {
 
       case 'join': {
-        // FIX: Allow joining waiting rooms. Block only if game is actively running.
+        if (playerId && this.playerData.has(playerId)) return;
         if (this.players.length >= MAX_PLAYERS)
           return this.tx(ws, { type:'error', message:'Room penuh (max 8 pemain)' });
         if (this.gState !== 'waiting')
@@ -63,20 +80,22 @@ export class GameRoom {
 
         const id = uid();
         const isHost = this.players.length === 0;
-        this.sessions.set(ws, { id, ws, name: (msg.name||'Player').slice(0,20), score:0, isHost, ready:false });
+        const player = { id, name:(msg.name||'Player').slice(0,20), score:0, isHost, ready:false };
+
+        ws.serializeAttachment({ id });
+        this.playerData.set(id, player);
         this.players.push(id);
 
         this.tx(ws, { type:'joined', playerId:id, isHost, players:this.plist() });
-        this.bcast({ type:'playerJoined', player:{ id, name:msg.name }, players:this.plist() }, ws);
+        this.bcastExcept(ws, { type:'playerJoined', player:{ id, name:player.name }, players:this.plist() });
         break;
       }
 
-      // NEW: Ready toggle
       case 'toggleReady': {
         if (!sess || this.gState !== 'waiting') return;
-        if (sess.isHost) return; // host doesn't need to ready up
+        if (sess.isHost) return;
         sess.ready = !sess.ready;
-        this.bcast({ type:'playerReady', playerId:sess.id, ready:sess.ready, players:this.plist() });
+        this.bcastAll({ type:'playerReady', playerId:sess.id, ready:sess.ready, players:this.plist() });
         break;
       }
 
@@ -86,9 +105,8 @@ export class GameRoom {
           return this.tx(ws, { type:'error', message:`Butuh minimal ${MIN_PLAYERS} pemain` });
         if (this.gState !== 'waiting') return;
 
-        // Check all non-host players are ready
-        const nonHosts = [...this.sessions.values()].filter(s => !s.isHost);
-        const allReady = nonHosts.every(s => s.ready);
+        const nonHosts = [...this.playerData.values()].filter(s => !s.isHost);
+        const allReady = nonHosts.length === 0 || nonHosts.every(s => s.ready);
         if (!allReady)
           return this.tx(ws, { type:'error', message:'Belum semua pemain siap!' });
 
@@ -108,14 +126,14 @@ export class GameRoom {
       case 'draw': {
         if (!sess || sess.id !== this.drawer || this.gState !== 'drawing') return;
         this.history.push(msg.data);
-        this.bcast({ type:'draw', data:msg.data }, ws);
+        this.bcastExcept(ws, { type:'draw', data:msg.data });
         break;
       }
 
       case 'clearCanvas': {
         if (!sess || sess.id !== this.drawer) return;
         this.history = [];
-        this.bcast({ type:'clearCanvas' }, ws);
+        this.bcastExcept(ws, { type:'clearCanvas' });
         break;
       }
 
@@ -136,16 +154,16 @@ export class GameRoom {
           const pts = Math.max(50, Math.floor(this.timeLeft * 1.5))
                     + Math.max(0, (this.players.length - this.guessed.size) * 10);
           sess.score += pts;
-          const drawerSess = this.sessById(this.drawer);
-          if (drawerSess) drawerSess.score += 15;
+          const drawerData = this.playerData.get(this.drawer);
+          if (drawerData) drawerData.score += 15;
 
-          this.bcast({ type:'correctGuess', playerId:sess.id, playerName:sess.name, score:pts, players:this.plist() });
+          this.bcastAll({ type:'correctGuess', playerId:sess.id, playerName:sess.name, score:pts, players:this.plist() });
 
           const nonDrawers = this.players.filter(p => p !== this.drawer);
           if (this.guessed.size >= nonDrawers.length) this.endRound(true);
         } else {
-          this.bcast({ type:'chat', playerId:sess.id, playerName:sess.name,
-            message: msg.guess.slice(0,200), isClose: lev(guess, target) <= 2 });
+          this.bcastAll({ type:'chat', playerId:sess.id, playerName:sess.name,
+            message:msg.guess.slice(0,200), isClose:lev(guess, target) <= 2 });
         }
         break;
       }
@@ -153,14 +171,13 @@ export class GameRoom {
       case 'chat': {
         if (!sess) return;
         if (this.gState === 'drawing' && sess.id !== this.drawer) return;
-        this.bcast({ type:'chat', playerId:sess.id, playerName:sess.name, message:(msg.message||'').slice(0,200) });
+        this.bcastAll({ type:'chat', playerId:sess.id, playerName:sess.name, message:(msg.message||'').slice(0,200) });
         break;
       }
 
-      // NEW: Leave room gracefully
       case 'leaveRoom': {
         if (!sess) return;
-        await this.webSocketClose(ws);
+        this.handleDisconnect(ws, sess.id);
         try { ws.close(1000, 'Left room'); } catch {}
         break;
       }
@@ -168,42 +185,51 @@ export class GameRoom {
   }
 
   async webSocketClose(ws) {
-    const sess = this.sessions.get(ws);
+    const id = this.getPlayerIdFromWs(ws);
+    if (id) this.handleDisconnect(ws, id);
+  }
+
+  async webSocketError(ws) {
+    const id = this.getPlayerIdFromWs(ws);
+    if (id) this.handleDisconnect(ws, id);
+  }
+
+  handleDisconnect(ws, id) {
+    const sess = this.playerData.get(id);
     if (!sess) return;
-    this.sessions.delete(ws);
-    this.players = this.players.filter(p => p !== sess.id);
+
+    this.playerData.delete(id);
+    this.players = this.players.filter(p => p !== id);
 
     if (this.players.length === 0) { this.clearTimers(); return; }
 
     if (sess.isHost) {
-      const newHost = this.sessById(this.players[0]);
+      const newHost = this.playerData.get(this.players[0]);
       if (newHost) newHost.isHost = true;
     }
 
-    this.bcast({ type:'playerLeft', playerId:sess.id, playerName:sess.name, players:this.plist() });
+    this.bcastAll({ type:'playerLeft', playerId:id, playerName:sess.name, players:this.plist() });
 
-    if (sess.id === this.drawer && this.gState === 'drawing') this.endRound(false);
+    if (id === this.drawer && this.gState === 'drawing') this.endRound(false);
 
     if (this.players.length < MIN_PLAYERS && this.gState !== 'waiting') {
       this.clearTimers();
       this.gState = 'waiting';
-      // Reset ready state for remaining players
-      this.sessions.forEach(s => { s.ready = false; });
-      this.bcast({ type:'notEnoughPlayers', players:this.plist() });
+      this.playerData.forEach(s => { s.ready = false; });
+      this.bcastAll({ type:'notEnoughPlayers', players:this.plist() });
     }
   }
-
-  async webSocketError(ws) { await this.webSocketClose(ws); }
-
-  // ── Game flow ──────────────────────────────────────────────────────
 
   startWordSelect() {
     this.gState   = 'selectingWord';
     this.wordOpts = randWords(3);
     this.guessed  = new Set();
-    const drawerSess = this.sessById(this.drawer);
-    if (drawerSess) this.tx(drawerSess.ws, { type:'selectWord', words:this.wordOpts });
-    this.bcast({ type:'drawerSelecting', drawerName: drawerSess?.name||'?' }, drawerSess?.ws);
+    const drawerData = this.playerData.get(this.drawer);
+    const drawerWs   = this.getWsById(this.drawer);
+
+    if (drawerWs) this.tx(drawerWs, { type:'selectWord', words:this.wordOpts });
+    this.bcastExcept(drawerWs, { type:'drawerSelecting', drawerName:drawerData?.name || '?' });
+
     this.wsTimeout = setTimeout(() => {
       if (this.gState === 'selectingWord') this.startDrawing(this.wordOpts[0]);
     }, 15000);
@@ -215,34 +241,38 @@ export class GameRoom {
     this.gState   = 'drawing';
     this.history  = [];
     this.timeLeft = ROUND_TIME;
-    const drawerSess = this.sessById(this.drawer);
+    const drawerData = this.playerData.get(this.drawer);
+    const drawerWs   = this.getWsById(this.drawer);
 
-    if (drawerSess) this.tx(drawerSess.ws, {
-      type:'gameState', state:'drawing', word, isDrawer:true,
-      players:this.plist(), timeLeft:this.timeLeft,
-      round:this.round, totalRounds:ROUNDS_PER_GAME,
-      drawerId:this.drawer, drawerName:drawerSess.name,
-    });
+    if (drawerWs) {
+      this.tx(drawerWs, {
+        type:'gameState', state:'drawing', word, isDrawer:true,
+        players:this.plist(), timeLeft:this.timeLeft,
+        round:this.round, totalRounds:ROUNDS_PER_GAME,
+        drawerId:this.drawer, drawerName:drawerData?.name,
+      });
+    }
 
     const masked = maskWord(word);
-    this.sessions.forEach((s, ws) => {
-      if (s.id === this.drawer) return;
+    for (const ws of this.state.getWebSockets()) {
+      const pid = this.getPlayerIdFromWs(ws);
+      if (!pid || pid === this.drawer) continue;
       this.tx(ws, {
         type:'gameState', state:'drawing', word:masked,
         wordLength:word.replace(/ /g,'').length, isDrawer:false,
         players:this.plist(), timeLeft:this.timeLeft,
         round:this.round, totalRounds:ROUNDS_PER_GAME,
-        drawerId:this.drawer, drawerName:drawerSess?.name,
+        drawerId:this.drawer, drawerName:drawerData?.name,
       });
-    });
+    }
 
     this.timerRef = setInterval(() => {
       this.timeLeft--;
       if (this.timeLeft === Math.floor(ROUND_TIME * 0.5) || this.timeLeft === Math.floor(ROUND_TIME * 0.25)) {
         const n = this.timeLeft === Math.floor(ROUND_TIME * 0.5) ? 1 : 2;
-        this.bcast({ type:'hint', word: hintWord(word, n) });
+        this.bcastAll({ type:'hint', word:hintWord(word, n) });
       }
-      this.bcast({ type:'timer', timeLeft:this.timeLeft });
+      this.bcastAll({ type:'timer', timeLeft:this.timeLeft });
       if (this.timeLeft <= 0) this.endRound(false);
     }, 1000);
   }
@@ -250,7 +280,7 @@ export class GameRoom {
   endRound(allGuessed) {
     this.clearTimers();
     this.gState = 'roundEnd';
-    this.bcast({ type:'roundEnd', word:this.word, players:this.plist(), allGuessed });
+    this.bcastAll({ type:'roundEnd', word:this.word, players:this.plist(), allGuessed });
     setTimeout(() => this.nextTurn(), 5000);
   }
 
@@ -266,54 +296,51 @@ export class GameRoom {
   endGame() {
     this.gState = 'gameOver';
     const sorted = this.plist().sort((a,b) => b.score - a.score);
-    this.bcast({ type:'gameOver', players:sorted });
+    this.bcastAll({ type:'gameOver', players:sorted });
     setTimeout(() => {
-      this.sessions.forEach(s => { s.score = 0; s.ready = false; });
+      this.playerData.forEach(s => { s.score = 0; s.ready = false; });
       this.gState = 'waiting'; this.round = 0;
       this.drawer = null; this.word = null; this.history = [];
-      this.bcast({ type:'lobby', players:this.plist() });
+      this.bcastAll({ type:'lobby', players:this.plist() });
     }, 10000);
   }
 
   clearTimers() {
-    clearInterval(this.timerRef); clearTimeout(this.wsTimeout);
-    this.timerRef = null; this.wsTimeout = null;
+    clearInterval(this.timerRef);
+    clearTimeout(this.wsTimeout);
+    this.timerRef = null;
+    this.wsTimeout = null;
   }
-
-  // ── Helpers ────────────────────────────────────────────────────────
 
   tx(ws, msg) { try { ws.send(JSON.stringify(msg)); } catch {} }
 
-  bcast(msg, skip = null) {
-    this.sessions.forEach((s, ws) => { if (ws !== skip) this.tx(ws, msg); });
+  bcastAll(msg) {
+    for (const ws of this.state.getWebSockets()) this.tx(ws, msg);
   }
 
-  sessById(id) {
-    for (const [, s] of this.sessions) if (s.id === id) return s;
-    return null;
+  bcastExcept(skipWs, msg) {
+    for (const ws of this.state.getWebSockets()) {
+      if (ws !== skipWs) this.tx(ws, msg);
+    }
   }
 
   plist() {
     return this.players.map(id => {
-      const s = this.sessById(id);
+      const s = this.playerData.get(id);
       return s ? { id:s.id, name:s.name, score:s.score, isHost:s.isHost, isDrawing:this.drawer===s.id, ready:s.ready } : null;
     }).filter(Boolean);
   }
 }
 
-// ─── Worker Entry ────────────────────────────────────────────────────
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
-
     const cors = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
     };
-
     if (req.method === 'OPTIONS') return new Response(null, { headers: cors });
-
     if (url.pathname.startsWith('/ws/')) {
       const roomId = url.pathname.slice(4).toUpperCase();
       if (!roomId || roomId.length < 4) return new Response('Invalid room', { status:400 });
@@ -321,18 +348,17 @@ export default {
       const stub = env.ROOMS.get(id);
       return stub.fetch(req);
     }
-
     if (url.pathname === '/health')
-      return new Response(JSON.stringify({ ok:true }), { headers:{ 'Content-Type':'application/json', ...cors } });
-
+      return new Response(JSON.stringify({ ok:true, ts:Date.now() }), {
+        headers:{ 'Content-Type':'application/json', ...cors }
+      });
     return new Response('SketchBattle Worker 🎨', { headers: cors });
   }
 };
 
-// ─── Utils ───────────────────────────────────────────────────────────
 function uid() { return Math.random().toString(36).slice(2,10); }
 function randWords(n) { return [...WORDS].sort(()=>Math.random()-.5).slice(0,n); }
-function maskWord(w) { return w.split('').map(c => c===' ' ? ' ' : '_').join(''); }
+function maskWord(w) { return w.split('').map(c => c===' '?' ':'_').join(''); }
 function hintWord(word, n) {
   const chars = word.split('');
   const idxs  = chars.map((c,i)=>c!==' '?i:-1).filter(i=>i!==-1);
