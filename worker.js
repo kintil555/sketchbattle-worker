@@ -25,8 +25,8 @@ const ROUNDS_PER_GAME = 3;
 // ─── Durable Object ───────────────────────────────────────────────────
 export class GameRoom {
   constructor(state) {
-    this.state = state;
-    this.sessions = new Map();   // ws → {id,name,score,isHost}
+    this.state    = state;
+    this.sessions = new Map();   // ws → {id,name,score,isHost,ready}
     this.players  = [];          // ordered ids
     this.gState   = 'waiting';   // waiting|selectingWord|drawing|roundEnd|gameOver
     this.drawer   = null;
@@ -55,18 +55,28 @@ export class GameRoom {
     switch (msg.type) {
 
       case 'join': {
+        // FIX: Allow joining waiting rooms. Block only if game is actively running.
         if (this.players.length >= MAX_PLAYERS)
           return this.tx(ws, { type:'error', message:'Room penuh (max 8 pemain)' });
         if (this.gState !== 'waiting')
-          return this.tx(ws, { type:'error', message:'Game sudah berjalan' });
+          return this.tx(ws, { type:'error', message:'Game sudah berjalan, tunggu ronde berikutnya' });
 
         const id = uid();
         const isHost = this.players.length === 0;
-        this.sessions.set(ws, { id, ws, name: (msg.name||'Player').slice(0,20), score:0, isHost });
+        this.sessions.set(ws, { id, ws, name: (msg.name||'Player').slice(0,20), score:0, isHost, ready:false });
         this.players.push(id);
 
         this.tx(ws, { type:'joined', playerId:id, isHost, players:this.plist() });
         this.bcast({ type:'playerJoined', player:{ id, name:msg.name }, players:this.plist() }, ws);
+        break;
+      }
+
+      // NEW: Ready toggle
+      case 'toggleReady': {
+        if (!sess || this.gState !== 'waiting') return;
+        if (sess.isHost) return; // host doesn't need to ready up
+        sess.ready = !sess.ready;
+        this.bcast({ type:'playerReady', playerId:sess.id, ready:sess.ready, players:this.plist() });
         break;
       }
 
@@ -75,6 +85,13 @@ export class GameRoom {
         if (this.players.length < MIN_PLAYERS)
           return this.tx(ws, { type:'error', message:`Butuh minimal ${MIN_PLAYERS} pemain` });
         if (this.gState !== 'waiting') return;
+
+        // Check all non-host players are ready
+        const nonHosts = [...this.sessions.values()].filter(s => !s.isHost);
+        const allReady = nonHosts.every(s => s.ready);
+        if (!allReady)
+          return this.tx(ws, { type:'error', message:'Belum semua pemain siap!' });
+
         this.round = 1;
         this.drawer = this.players[0];
         this.startWordSelect();
@@ -139,6 +156,14 @@ export class GameRoom {
         this.bcast({ type:'chat', playerId:sess.id, playerName:sess.name, message:(msg.message||'').slice(0,200) });
         break;
       }
+
+      // NEW: Leave room gracefully
+      case 'leaveRoom': {
+        if (!sess) return;
+        await this.webSocketClose(ws);
+        try { ws.close(1000, 'Left room'); } catch {}
+        break;
+      }
     }
   }
 
@@ -162,6 +187,8 @@ export class GameRoom {
     if (this.players.length < MIN_PLAYERS && this.gState !== 'waiting') {
       this.clearTimers();
       this.gState = 'waiting';
+      // Reset ready state for remaining players
+      this.sessions.forEach(s => { s.ready = false; });
       this.bcast({ type:'notEnoughPlayers', players:this.plist() });
     }
   }
@@ -190,7 +217,6 @@ export class GameRoom {
     this.timeLeft = ROUND_TIME;
     const drawerSess = this.sessById(this.drawer);
 
-    // Drawer gets full word
     if (drawerSess) this.tx(drawerSess.ws, {
       type:'gameState', state:'drawing', word, isDrawer:true,
       players:this.plist(), timeLeft:this.timeLeft,
@@ -198,7 +224,6 @@ export class GameRoom {
       drawerId:this.drawer, drawerName:drawerSess.name,
     });
 
-    // Others get masked word
     const masked = maskWord(word);
     this.sessions.forEach((s, ws) => {
       if (s.id === this.drawer) return;
@@ -211,7 +236,6 @@ export class GameRoom {
       });
     });
 
-    // Countdown
     this.timerRef = setInterval(() => {
       this.timeLeft--;
       if (this.timeLeft === Math.floor(ROUND_TIME * 0.5) || this.timeLeft === Math.floor(ROUND_TIME * 0.25)) {
@@ -244,7 +268,7 @@ export class GameRoom {
     const sorted = this.plist().sort((a,b) => b.score - a.score);
     this.bcast({ type:'gameOver', players:sorted });
     setTimeout(() => {
-      this.sessions.forEach(s => s.score = 0);
+      this.sessions.forEach(s => { s.score = 0; s.ready = false; });
       this.gState = 'waiting'; this.round = 0;
       this.drawer = null; this.word = null; this.history = [];
       this.bcast({ type:'lobby', players:this.plist() });
@@ -272,7 +296,7 @@ export class GameRoom {
   plist() {
     return this.players.map(id => {
       const s = this.sessById(id);
-      return s ? { id:s.id, name:s.name, score:s.score, isHost:s.isHost, isDrawing:this.drawer===s.id } : null;
+      return s ? { id:s.id, name:s.name, score:s.score, isHost:s.isHost, isDrawing:this.drawer===s.id, ready:s.ready } : null;
     }).filter(Boolean);
   }
 }
@@ -290,7 +314,6 @@ export default {
 
     if (req.method === 'OPTIONS') return new Response(null, { headers: cors });
 
-    // WebSocket endpoint: /ws/ROOMCODE
     if (url.pathname.startsWith('/ws/')) {
       const roomId = url.pathname.slice(4).toUpperCase();
       if (!roomId || roomId.length < 4) return new Response('Invalid room', { status:400 });
